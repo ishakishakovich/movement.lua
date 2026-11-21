@@ -1,4 +1,4 @@
---[[ Nyx Movement Suite v6.0 ]]--
+--[[ Nyx Movement Suite v7.0 ]]--
 
 local Players      = game:GetService("Players")
 local UIS          = game:GetService("UserInputService")
@@ -15,8 +15,7 @@ local CONFIG_PATH = "nyx_movement_cfg.json"
 local state = {
     bhop        = true,
     pixelSurf   = true,
-    airStrafe   = false,
-    autoStrafe  = false,
+    airStrafe   = true,
     fastLadder  = true,
     edgeBug     = false,
     doubleJump  = true,
@@ -24,29 +23,28 @@ local state = {
     slide       = false,
     slopeGuard  = true,
     speedometer = true,
-    speed       = 46,
-    jumpPower   = 52,
-    surfSpeed   = 26,
-    airMul      = 1.02,
-    gravity     = 196.2,
-    surfBind    = Enum.KeyCode.Q,
+    speed         = 42,
+    jumpPower     = 52,
+    surfSpeed     = 26,
+    gravity       = 196.2,
+    strafeAccel   = 8,
+    maxAirSpeed   = 55,
+    surfBind      = Enum.KeyCode.Q,
 }
+
+local strafeGain = 0
 
 -- ============ CONFIG I/O ============
 
 local function saveConfig()
     local data = {}
     for k, v in pairs(state) do
-        if typeof(v) == "EnumItem" then
-            data[k] = v.Name
-        else
-            data[k] = v
-        end
+        if typeof(v) == "EnumItem" then data[k] = v.Name
+        else data[k] = v end
     end
-    local ok, encoded = pcall(function() return game:GetService("HttpService"):JSONEncode(data) end)
+    local ok, enc = pcall(function() return game:GetService("HttpService"):JSONEncode(data) end)
     if not ok then return false end
-    local ok2 = pcall(function() writefile(CONFIG_PATH, encoded) end)
-    return ok2
+    return pcall(function() writefile(CONFIG_PATH, enc) end)
 end
 
 local function loadConfig()
@@ -75,6 +73,24 @@ local function getHum()
     return char and char:FindFirstChildOfClass("Humanoid"), char
 end
 local function grounded(hum) return hum.FloorMaterial ~= Enum.Material.Air end
+
+local function getWishDir(hum)
+    local md = hum.MoveDirection
+    if md.Magnitude > 0.01 then
+        return Vector3.new(md.X, 0, md.Z).Unit
+    end
+    local cam = workspace.CurrentCamera
+    local cf = cam.CFrame
+    local fwd = Vector3.new(cf.LookVector.X, 0, cf.LookVector.Z)
+    if fwd.Magnitude < 0.01 then return nil end
+    fwd = fwd.Unit
+    local right = Vector3.new(cf.RightVector.X, 0, cf.RightVector.Z).Unit
+    local f = (UIS:IsKeyDown(Enum.KeyCode.W) and 1 or 0) - (UIS:IsKeyDown(Enum.KeyCode.S) and 1 or 0)
+    local s = (UIS:IsKeyDown(Enum.KeyCode.D) and 1 or 0) - (UIS:IsKeyDown(Enum.KeyCode.A) and 1 or 0)
+    local wish = fwd * f + right * s
+    if wish.Magnitude > 0.01 then return wish.Unit end
+    return nil
+end
 
 -- ============ TOAST ============
 
@@ -186,7 +202,18 @@ addConn(RunService.Heartbeat:Connect(function(dt)
 
     hum.WalkSpeed = sliding and (state.speed * 1.5) or state.speed
 
-    -- CLAMP: не даём скорости залипнуть
+    -- HARD CAP in air (anti fly-away)
+    if not onGround then
+        local flat = Vector3.new(vel.X, 0, vel.Z)
+        local hardCap = state.maxAirSpeed * 1.2
+        if flat.Magnitude > hardCap then
+            flat = flat.Unit * hardCap
+            root.AssemblyLinearVelocity = Vector3.new(flat.X, vel.Y, flat.Z)
+            vel = root.AssemblyLinearVelocity
+        end
+    end
+
+    -- GROUND clamp (not bhoping, not sliding)
     if onGround and not bhopActive and not sliding then
         local flat = Vector3.new(vel.X, 0, vel.Z)
         if flat.Magnitude > state.speed + 2 then
@@ -195,19 +222,46 @@ addConn(RunService.Heartbeat:Connect(function(dt)
         end
     end
 
-    -- BHOP с прыжковым импульсом (резвее, но без разгона)
+    -- BHOP — preserve momentum instead of resetting
     if bhopActive and onGround and now - lastJump > 0.05 then
         local slopeDeg = slopeAngle(char, root)
         if not (state.slopeGuard and slopeDeg > 45) then
-            local moveDir = hum.MoveDirection
-            if moveDir.Magnitude > 0.1 then
-                local pushSpeed = state.speed * 1.08
-                root.AssemblyLinearVelocity = Vector3.new(
-                    moveDir.X * pushSpeed, math.max(vel.Y, 0), moveDir.Z * pushSpeed
-                )
+            local flat = Vector3.new(vel.X, 0, vel.Z)
+            local carryCap = state.speed * 1.3
+
+            if flat.Magnitude < 0.5 then
+                local md = hum.MoveDirection
+                if md.Magnitude > 0.1 then
+                    flat = Vector3.new(md.X, 0, md.Z).Unit * state.speed * 0.85
+                end
+            elseif flat.Magnitude > carryCap then
+                flat = flat.Unit * carryCap
             end
+
+            root.AssemblyLinearVelocity = Vector3.new(flat.X, vel.Y, flat.Z)
             hum.Jump = true
             lastJump = now
+        end
+    end
+
+    -- REAL AIR-STRAFE (Quake/Source formula)
+    strafeGain = 0
+    if state.airStrafe and not onGround and not (state.pixelSurf and surfDown) then
+        local wishdir = getWishDir(hum)
+        if wishdir then
+            local flat = Vector3.new(vel.X, 0, vel.Z)
+            local currentSpeed = flat:Dot(wishdir)
+            local addSpeed = state.maxAirSpeed - currentSpeed
+            if addSpeed > 0 then
+                local accelSpeed = state.strafeAccel * state.maxAirSpeed * dt
+                if accelSpeed > addSpeed then accelSpeed = addSpeed end
+                local newFlat = flat + wishdir * accelSpeed
+                if newFlat.Magnitude > state.maxAirSpeed then
+                    newFlat = newFlat.Unit * state.maxAirSpeed
+                end
+                strafeGain = (newFlat - flat).Magnitude
+                root.AssemblyLinearVelocity = Vector3.new(newFlat.X, vel.Y, newFlat.Z)
+            end
         end
     end
 
@@ -217,30 +271,6 @@ addConn(RunService.Heartbeat:Connect(function(dt)
         if flat.Magnitude > 0.1 then
             local dir = flat.Unit
             root.AssemblyLinearVelocity = Vector3.new(dir.X * state.surfSpeed, 0, dir.Z * state.surfSpeed)
-        end
-    end
-
-    -- AIR STRAFE
-    if state.airStrafe and not onGround and not (state.pixelSurf and surfDown) then
-        local flat = Vector3.new(vel.X, 0, vel.Z)
-        local mag = flat.Magnitude
-        local cap = state.speed * 1.15
-        if mag > 1 and mag < cap then
-            root.AssemblyLinearVelocity = Vector3.new(flat.X * state.airMul, vel.Y, flat.Z * state.airMul)
-        end
-    end
-
-    -- AUTO STRAFE
-    if state.autoStrafe and not onGround then
-        local flat = Vector3.new(vel.X, 0, vel.Z)
-        local cap = state.speed * 1.15
-        if flat.Magnitude > 1 and flat.Magnitude < cap then
-            local moveDir = hum.MoveDirection
-            if moveDir.Magnitude > 0.1 then
-                local perp = Vector3.new(-flat.Unit.Z, 0, flat.Unit.X)
-                local side = math.sign(perp:Dot(moveDir))
-                root.AssemblyLinearVelocity = flat + perp * side * 2 + Vector3.new(0, vel.Y, 0)
-            end
         end
     end
 
@@ -270,7 +300,7 @@ addConn(RunService.Heartbeat:Connect(function(dt)
     end
 end))
 
--- ============ SPEEDOMETER + STATUS ============
+-- ============ SPEEDOMETER ============
 
 local function buildSpeedo()
     speedoGui = Instance.new("ScreenGui")
@@ -279,7 +309,7 @@ local function buildSpeedo()
     speedoGui.Parent = lp:WaitForChild("PlayerGui")
 
     local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(0, 180, 0, 60)
+    frame.Size = UDim2.new(0, 180, 0, 66)
     frame.Position = UDim2.new(0, 20, 0, 20)
     frame.BackgroundColor3 = Color3.fromRGB(14, 14, 18)
     frame.BackgroundTransparency = 0.15
@@ -295,7 +325,7 @@ local function buildSpeedo()
 
     speedoLabel = Instance.new("TextLabel")
     speedoLabel.Size = UDim2.new(1, 0, 0, 30)
-    speedoLabel.Position = UDim2.new(0, 0, 0, 6)
+    speedoLabel.Position = UDim2.new(0, 0, 0, 8)
     speedoLabel.BackgroundTransparency = 1
     speedoLabel.Text = "0  studs/s"
     speedoLabel.TextColor3 = Color3.fromRGB(230, 230, 240)
@@ -304,8 +334,8 @@ local function buildSpeedo()
     speedoLabel.Parent = frame
 
     statusLabel = Instance.new("TextLabel")
-    statusLabel.Size = UDim2.new(1, 0, 0, 18)
-    statusLabel.Position = UDim2.new(0, 0, 0, 36)
+    statusLabel.Size = UDim2.new(1, 0, 0, 20)
+    statusLabel.Position = UDim2.new(0, 0, 0, 40)
     statusLabel.BackgroundTransparency = 1
     statusLabel.Text = "idle"
     statusLabel.TextColor3 = Color3.fromRGB(120, 130, 160)
@@ -315,7 +345,7 @@ local function buildSpeedo()
 end
 
 addConn(RunService.RenderStepped:Connect(function()
-    if not state.speedometer or not speedoLabel then
+    if not state.speedometer then
         if speedoGui then speedoGui.Enabled = false end
         return
     end
@@ -330,19 +360,20 @@ addConn(RunService.RenderStepped:Connect(function()
     local onGround = grounded(hum)
     if sliding then tag = "slide"
     elseif state.pixelSurf and surfDown and not onGround then tag = "surf"
-    elseif state.bhop and spaceDown and not onGround then tag = "bhop"
+    elseif not onGround and strafeGain > 0.5 then tag = "strafe+"
+    elseif not onGround and state.bhop and spaceDown then tag = "bhop"
     elseif not onGround then tag = "air"
     elseif hum.MoveDirection.Magnitude > 0.1 then tag = "run"
     end
     statusLabel.Text = tag
-    if tag ~= "idle" and tag ~= "run" then
+    if tag == "strafe+" then
+        statusLabel.TextColor3 = Color3.fromRGB(120, 220, 255)
+    elseif tag ~= "idle" and tag ~= "run" then
         statusLabel.TextColor3 = Color3.fromRGB(90, 160, 255)
     else
         statusLabel.TextColor3 = Color3.fromRGB(120, 130, 160)
     end
 end))
-
--- ============ TOAST GUI ============
 
 local function buildToast()
     toastGui = Instance.new("ScreenGui")
@@ -389,16 +420,22 @@ local function makeToggle(parent, text, key, hint, yPos)
     label.Parent = row
 
     if hint then
+        local pill = Instance.new("Frame")
+        pill.Size = UDim2.new(0, 56, 0, 18)
+        pill.Position = UDim2.new(1, -118, 0.5, -9)
+        pill.BackgroundColor3 = Color3.fromRGB(30, 34, 44)
+        pill.BorderSizePixel = 0
+        pill.Parent = row
+        Instance.new("UICorner", pill).CornerRadius = UDim.new(1, 0)
+
         local h = Instance.new("TextLabel")
-        h.Size = UDim2.new(0, 60, 1, 0)
-        h.Position = UDim2.new(1, -112, 0, 0)
+        h.Size = UDim2.new(1, 0, 1, 0)
         h.BackgroundTransparency = 1
         h.Text = hint
-        h.TextColor3 = Color3.fromRGB(110, 110, 130)
-        h.Font = Enum.Font.Gotham
-        h.TextSize = 11
-        h.TextXAlignment = Enum.TextXAlignment.Right
-        h.Parent = row
+        h.TextColor3 = Color3.fromRGB(130, 150, 190)
+        h.Font = Enum.Font.GothamBold
+        h.TextSize = 10
+        h.Parent = pill
     end
 
     local btn = Instance.new("TextButton")
@@ -427,7 +464,14 @@ local function makeToggle(parent, text, key, hint, yPos)
         TweenService:Create(knob, TweenInfo.new(0.15), {
             Position = state[key] and UDim2.new(1, -18, 0.5, -8) or UDim2.new(0, 2, 0.5, -8)
         }):Play()
-        toast(text .. ": " .. (state[key] and "on" or "off"))
+        local popSize = state[key] and UDim2.new(0, 20, 0, 20) or UDim2.new(0, 16, 0, 16)
+        local popPos = state[key] and UDim2.new(1, -20, 0.5, -10) or UDim2.new(0, 0, 0.5, -10)
+        knob.Size = popSize
+        knob.Position = popPos
+        TweenService:Create(knob, TweenInfo.new(0.15), {
+            Size = UDim2.new(0, 16, 0, 16),
+            Position = state[key] and UDim2.new(1, -18, 0.5, -8) or UDim2.new(0, 2, 0.5, -8)
+        }):Play()
     end)
 end
 
@@ -473,6 +517,12 @@ local function makeSlider(parent, text, key, min, max, yPos, onChange)
         state[key] = val
         fill.Size = UDim2.new(p, 0, 1, 0)
         label.Text = text .. ": " .. tostring(val)
+        fill.BackgroundColor3 = Color3.fromRGB(140, 200, 255)
+        task.delay(0.15, function()
+            if fill and fill.Parent then
+                TweenService:Create(fill, TweenInfo.new(0.2), {BackgroundColor3 = Color3.fromRGB(90, 160, 255)}):Play()
+            end
+        end)
         if onChange then onChange(val) end
     end
 
@@ -510,8 +560,8 @@ local function buildUI()
     gui.Parent = lp:WaitForChild("PlayerGui")
 
     mainFrame = Instance.new("Frame")
-    mainFrame.Size = UDim2.new(0, 320, 0, 500)
-    mainFrame.Position = UDim2.new(0.5, -160, 0.5, -250)
+    mainFrame.Size = UDim2.new(0, 340, 0, 520)
+    mainFrame.Position = UDim2.new(0.5, -170, 0.5, -260)
     mainFrame.BackgroundColor3 = Color3.fromRGB(14, 14, 18)
     mainFrame.BorderSizePixel = 0
     mainFrame.Active = true
@@ -526,12 +576,19 @@ local function buildUI()
     local grad = Instance.new("UIGradient")
     grad.Color = ColorSequence.new{
         ColorSequenceKeypoint.new(0, Color3.fromRGB(90, 160, 255)),
-        ColorSequenceKeypoint.new(1, Color3.fromRGB(160, 90, 255)),
+        ColorSequenceKeypoint.new(0.5, Color3.fromRGB(160, 90, 255)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(90, 160, 255)),
     }
     grad.Rotation = 45
     grad.Parent = stroke
 
-    -- header
+    -- pulsing gradient
+    addConn(RunService.RenderStepped:Connect(function()
+        if stroke and stroke.Parent then
+            grad.Rotation = (grad.Rotation + 0.4) % 360
+        end
+    end))
+
     local header = Instance.new("Frame")
     header.Size = UDim2.new(1, 0, 0, 46)
     header.BackgroundColor3 = Color3.fromRGB(20, 20, 26)
@@ -547,7 +604,7 @@ local function buildUI()
     title.Size = UDim2.new(1, -50, 1, 0)
     title.Position = UDim2.new(0, 16, 0, 0)
     title.BackgroundTransparency = 1
-    title.Text = "Nyx  ·  Movement  v6"
+    title.Text = "Nyx  ·  Movement  v7"
     title.TextColor3 = Color3.fromRGB(230, 230, 240)
     title.Font = Enum.Font.GothamBold
     title.TextSize = 16
@@ -563,24 +620,13 @@ local function buildUI()
     close.Font = Enum.Font.GothamBold
     close.TextSize = 16
     close.BorderSizePixel = 0
+    close.AutoButtonColor = false
     close.Parent = header
     Instance.new("UICorner", close).CornerRadius = UDim.new(1, 0)
     close.MouseButton1Click:Connect(function()
-        TweenService:Create(mainFrame, TweenInfo.new(0.15), {BackgroundTransparency = 1}):Play()
-        for _, d in pairs(mainFrame:GetDescendants()) do
-            if d:IsA("GuiObject") and d ~= mainFrame then
-                pcall(function()
-                    if d.BackgroundTransparency ~= nil and d:IsA("Frame") then d.BackgroundTransparency = 1 end
-                    if d:IsA("TextLabel") or d:IsA("TextButton") then d.TextTransparency = 1 end
-                end)
-            end
-        end
-        task.delay(0.2, function()
-            mainFrame.Visible = false
-        end)
+        mainFrame.Visible = false
     end)
 
-    -- drag
     local dh, ds, dp
     header.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 then
@@ -597,7 +643,6 @@ local function buildUI()
         if input.UserInputType == Enum.UserInputType.MouseButton1 then dh = false end
     end))
 
-    -- tabs
     local tabBar = Instance.new("Frame")
     tabBar.Size = UDim2.new(1, -20, 0, 30)
     tabBar.Position = UDim2.new(0, 10, 0, 52)
@@ -617,10 +662,11 @@ local function buildUI()
 
     local tabs = {}
     local tabButtons = {}
+    local tabUnderlines = {}
 
     local function makeTabButton(name)
         local b = Instance.new("TextButton")
-        b.Size = UDim2.new(0, 92, 1, 0)
+        b.Size = UDim2.new(0, 100, 1, 0)
         b.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
         b.Text = name
         b.TextColor3 = Color3.fromRGB(150, 150, 170)
@@ -630,6 +676,15 @@ local function buildUI()
         b.AutoButtonColor = false
         b.Parent = tabBar
         Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+
+        local ul = Instance.new("Frame")
+        ul.Size = UDim2.new(0.6, 0, 0, 2)
+        ul.Position = UDim2.new(0.2, 0, 1, -2)
+        ul.BackgroundColor3 = Color3.fromRGB(90, 160, 255)
+        ul.BorderSizePixel = 0
+        ul.BackgroundTransparency = 1
+        ul.Parent = b
+        table.insert(tabUnderlines, ul)
 
         b.MouseEnter:Connect(function()
             if not b:GetAttribute("active") then
@@ -651,11 +706,15 @@ local function buildUI()
                     TextColor3 = Color3.fromRGB(150, 150, 170),
                 }):Play()
             end
+            for _, u in ipairs(tabUnderlines) do
+                TweenService:Create(u, TweenInfo.new(0.15), {BackgroundTransparency = 1}):Play()
+            end
             b:SetAttribute("active", true)
             TweenService:Create(b, TweenInfo.new(0.15), {
                 BackgroundColor3 = Color3.fromRGB(90, 160, 255),
                 TextColor3 = Color3.fromRGB(255, 255, 255),
             }):Play()
+            TweenService:Create(ul, TweenInfo.new(0.15), {BackgroundTransparency = 0}):Play()
             tabs[name].page.Visible = true
         end)
 
@@ -690,9 +749,8 @@ local function buildUI()
     local y = 6
     makeCategoryLabel(pageMove, "MOVEMENT", y); y = y + 22
     makeToggle(pageMove, "Auto Bhop", "bhop", "space", y); y = y + 40
+    makeToggle(pageMove, "Air Strafe", "airStrafe", "a/d + turn", y); y = y + 40
     makeToggle(pageMove, "Pixel Surf", "pixelSurf", "bind", y); y = y + 40
-    makeToggle(pageMove, "Air Strafe", "airStrafe", nil, y); y = y + 40
-    makeToggle(pageMove, "Auto Strafe", "autoStrafe", nil, y); y = y + 40
     makeToggle(pageMove, "Fast Ladder", "fastLadder", nil, y); y = y + 40
     makeToggle(pageMove, "Edge Bug", "edgeBug", nil, y); y = y + 40
     makeToggle(pageMove, "Double Jump", "doubleJump", "space air", y); y = y + 40
@@ -704,15 +762,17 @@ local function buildUI()
 
     -- TUNE
     y = 6
+    makeCategoryLabel(pageTune, "STRAFE (CS-LIKE)", y); y = y + 22
+    makeSlider(pageTune, "Strafe Accel", "strafeAccel", 2, 30, y); y = y + 50
+    makeSlider(pageTune, "Max Air Speed", "maxAirSpeed", 20, 120, y); y = y + 50
+
     makeCategoryLabel(pageTune, "SPEED", y); y = y + 22
-    makeSlider(pageTune, "Walk Speed", "speed", 16, 140, y); y = y + 50
+    makeSlider(pageTune, "Walk Speed", "speed", 16, 100, y); y = y + 50
     makeSlider(pageTune, "Jump Power", "jumpPower", 50, 250, y, function(v)
         local hum = getHum(); if hum then hum.JumpPower = v end
     end); y = y + 50
     makeSlider(pageTune, "Surf Speed", "surfSpeed", 8, 100, y); y = y + 50
-    makeSlider(pageTune, "Air Mul %", "airMul", 100, 115, y, function(v)
-        state.airMul = v / 100
-    end); y = y + 50
+
     makeCategoryLabel(pageTune, "PHYSICS", y); y = y + 22
     makeSlider(pageTune, "Gravity", "gravity", 40, 400, y, function(v)
         workspace.Gravity = v
@@ -804,30 +864,26 @@ local function buildUI()
     makeActionBtn("Load Config", Color3.fromRGB(50, 60, 90), y, function()
         if loadConfig() then toast("config loaded") else toast("load failed") end
     end); y = y + 38
-    makeActionBtn("Reset Config", Color3.fromRGB(90, 60, 50), y, function()
-        toast("restart to apply defaults")
-    end); y = y + 38
 
     y = y + 6
-    makeCategoryLabel(pageCfg, "INFO", y); y = y + 22
+    makeCategoryLabel(pageCfg, "HOW TO STRAFE", y); y = y + 22
 
     local info = Instance.new("TextLabel")
-    info.Size = UDim2.new(1, -20, 0, 90)
+    info.Size = UDim2.new(1, -20, 0, 130)
     info.Position = UDim2.new(0, 10, 0, y)
     info.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
     info.BorderSizePixel = 0
-    info.Text = "  RightShift  —  toggle menu\n  Space  —  bhop / double jump\n  Bind  —  pixel surf\n  Ctrl + Space  —  long jump\n  Ctrl  —  slide"
+    info.Text = "  Strafe работает как в CS:\n  •  в воздухе держи A или D\n  •  одновременно плавно поворачивай мышку\n    в ту же сторону\n  •  скорость крутится по дуге, не растёт\n  •  статус в спидометре \"strafe+\" — работаешь\n\n  RightShift  —  меню\n  Space  —  bhop / double jump\n  Ctrl  —  slide,  Ctrl+Space  —  long jump"
     info.TextColor3 = Color3.fromRGB(180, 180, 200)
     info.Font = Enum.Font.Gotham
-    info.TextSize = 12
+    info.TextSize = 11
     info.TextXAlignment = Enum.TextXAlignment.Left
     info.TextYAlignment = Enum.TextYAlignment.Top
     info.Parent = pageCfg
     Instance.new("UICorner", info).CornerRadius = UDim.new(0, 6)
 
-    pageCfg.CanvasSize = UDim2.new(0, 0, 0, y + 110)
+    pageCfg.CanvasSize = UDim2.new(0, 0, 0, y + 145)
 
-    -- unload
     local unloadBtn = Instance.new("TextButton")
     unloadBtn.Size = UDim2.new(1, -20, 0, 34)
     unloadBtn.Position = UDim2.new(0, 10, 1, -44)
@@ -848,13 +904,13 @@ local function buildUI()
         TweenService:Create(unloadBtn, TweenInfo.new(0.1), {BackgroundColor3 = Color3.fromRGB(160, 60, 60)}):Play()
     end)
 
-    -- default tab
     tabs["Move"].page.Visible = true
-    for _, b in ipairs(tabButtons) do
+    for i, b in ipairs(tabButtons) do
         if b.Text == "Move" then
             b:SetAttribute("active", true)
             b.BackgroundColor3 = Color3.fromRGB(90, 160, 255)
             b.TextColor3 = Color3.fromRGB(255, 255, 255)
+            tabUnderlines[i].BackgroundTransparency = 0
         end
     end
 
@@ -862,21 +918,12 @@ local function buildUI()
         if gp then return end
         if input.KeyCode == Enum.KeyCode.RightShift then
             mainFrame.Visible = not mainFrame.Visible
-            if mainFrame.Visible then
-                for _, d in pairs(mainFrame:GetDescendants()) do
-                    if d:IsA("Frame") and d.BackgroundTransparency == 1 then
-                        -- skip
-                    end
-                end
-            end
         end
     end))
 end
-
--- ============ INIT ============
 
 pcall(loadConfig)
 buildUI()
 buildSpeedo()
 buildToast()
-print("[Nyx] v6.0 loaded — RightShift toggle menu.")
+print("[Nyx] v7.0 loaded — RightShift toggle menu.")
