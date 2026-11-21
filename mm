@@ -1,18 +1,22 @@
---[[ Nyx Movement Suite v8.0 ]]--
+--[[ Nyx Suite v9.0 — Movement + Combat + Visual ]]--
 
 local Players      = game:GetService("Players")
 local UIS          = game:GetService("UserInputService")
 local RunService   = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
+local VIM          = game:GetService("VirtualInputManager")
 
 local lp = Players.LocalPlayer
+local cam = workspace.CurrentCamera
 local conns = {}
 local gui, mainFrame, speedoGui, speedoLabel, statusLabel, accLabel, toastGui
-local listeningForBind = false
+local listeningForBind = nil
+local drawingSupported = pcall(function() local d = Drawing.new("Line"); d:Remove() end)
 
-local CONFIG_PATH = "nyx_movement_cfg.json"
+local CONFIG_PATH = "nyx_suite_cfg.json"
 
 local state = {
+    -- movement
     bhop        = true,
     pixelSurf   = true,
     airStrafe   = true,
@@ -32,6 +36,26 @@ local state = {
     hopInc        = 2.5,
     maxBhopSpeed  = 68,
     surfBind      = Enum.KeyCode.Q,
+
+    -- combat
+    aimbot      = false,
+    silentAim   = false,
+    triggerBot  = false,
+    aimFov      = 150,
+    aimSmooth   = 20,
+    aimPart     = "Head",
+    wallCheck   = true,
+    teamCheck   = true,
+    friendCheck = false,
+    aimFovCircle = true,
+    trigDelay   = 0.05,
+
+    -- visual
+    espBox      = true,
+    espName     = true,
+    espDistance = true,
+    espHealth   = true,
+    espTracer   = false,
 }
 
 local strafeGain = 0
@@ -76,7 +100,6 @@ end
 local function grounded(hum) return hum.FloorMaterial ~= Enum.Material.Air end
 
 local function getWishDir(hum)
-    local cam = workspace.CurrentCamera
     local cf = cam.CFrame
     local fwd = Vector3.new(cf.LookVector.X, 0, cf.LookVector.Z)
     if fwd.Magnitude < 0.01 then return nil end
@@ -94,8 +117,8 @@ end
 local function toast(text)
     if not toastGui then return end
     local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(0, 200, 0, 36)
-    frame.Position = UDim2.new(1, -220, 1, -80)
+    frame.Size = UDim2.new(0, 220, 0, 36)
+    frame.Position = UDim2.new(1, -240, 1, -80)
     frame.BackgroundColor3 = Color3.fromRGB(20, 20, 26)
     frame.BackgroundTransparency = 0.1
     frame.BorderSizePixel = 0
@@ -119,13 +142,13 @@ local function toast(text)
     lbl.TextXAlignment = Enum.TextXAlignment.Left
     lbl.Parent = frame
 
-    TweenService:Create(frame, TweenInfo.new(0.3, Enum.EasingStyle.Quad), {
-        Position = UDim2.new(1, -220, 1, -130)
+    TweenService:Create(frame, TweenInfo.new(0.3), {
+        Position = UDim2.new(1, -240, 1, -130)
     }):Play()
 
     task.delay(1.5, function()
         TweenService:Create(frame, TweenInfo.new(0.3), {
-            Position = UDim2.new(1, -220, 1, -80),
+            Position = UDim2.new(1, -240, 1, -80),
             BackgroundTransparency = 1
         }):Play()
         TweenService:Create(lbl, TweenInfo.new(0.3), {TextTransparency = 1}):Play()
@@ -133,7 +156,7 @@ local function toast(text)
     end)
 end
 
--- ============ CORE ============
+-- ============ MOVEMENT CORE ============
 
 local spaceDown, surfDown = false, false
 local lastJump, jumpsLeft, sliding = 0, 1, false
@@ -188,7 +211,6 @@ addConn(RunService.Heartbeat:Connect(function(dt)
 
     if onGround then jumpsLeft = 1 end
 
-    -- SLIDE
     if sliding and (not state.slide or not ctrlDown or not onGround) then
         sliding = false
         hum.HipHeight = 2
@@ -198,7 +220,6 @@ addConn(RunService.Heartbeat:Connect(function(dt)
         hum.HipHeight = 0.2
     end
 
-    -- BHOP CHAIN DECAY: без пробела или после 0.35с простоя — плавно к базе
     if not bhopActive then
         if now - lastHopTime > 0.35 then
             bhopSpeed = bhopSpeed + (state.speed - bhopSpeed) * math.min(dt * 6, 1)
@@ -206,10 +227,8 @@ addConn(RunService.Heartbeat:Connect(function(dt)
     end
     if math.abs(bhopSpeed - state.speed) < 0.2 then bhopSpeed = state.speed end
 
-    -- WalkSpeed = актуальная bhopSpeed → ground-solver не режет
     hum.WalkSpeed = sliding and (state.speed * 1.5) or math.max(state.speed, bhopSpeed)
 
-    -- HARD CAP в воздухе
     if not onGround then
         local flat = Vector3.new(vel.X, 0, vel.Z)
         local hardCap = math.max(state.maxBhopSpeed, state.maxAirSpeed) * 1.15
@@ -220,7 +239,6 @@ addConn(RunService.Heartbeat:Connect(function(dt)
         end
     end
 
-    -- === BHOP (с накоплением, БЕЗ дэша) ===
     if bhopActive and onGround and now - lastJump > 0.04 then
         local slopeDeg = slopeAngle(char, root)
         if not (state.slopeGuard and slopeDeg > 45) then
@@ -240,11 +258,9 @@ addConn(RunService.Heartbeat:Connect(function(dt)
                 curSpeed = state.speed
             end
 
-            -- добавляем МАЛО, не сбрасываем
             local newSpeed = math.min(curSpeed + state.hopInc, state.maxBhopSpeed)
             bhopSpeed = newSpeed
 
-            -- направление: 85% прежнее, 15% к новому инпуту
             local newDir = curDir
             if md.Magnitude > 0.1 then
                 local wishDir = Vector3.new(md.X, 0, md.Z).Unit
@@ -252,11 +268,8 @@ addConn(RunService.Heartbeat:Connect(function(dt)
                 if blended.Magnitude > 0.01 then newDir = blended.Unit end
             end
 
-            -- Y не задаём — hum.Jump применит своё
             root.AssemblyLinearVelocity = Vector3.new(
-                newDir.X * newSpeed,
-                math.max(vel.Y, 0),
-                newDir.Z * newSpeed
+                newDir.X * newSpeed, math.max(vel.Y, 0), newDir.Z * newSpeed
             )
             hum.Jump = true
             lastJump = now
@@ -264,7 +277,6 @@ addConn(RunService.Heartbeat:Connect(function(dt)
         end
     end
 
-    -- GROUND clamp если не в цепочке
     if onGround and not bhopActive and not sliding then
         if now - lastHopTime > 0.5 then
             local flat = Vector3.new(vel.X, 0, vel.Z)
@@ -275,7 +287,6 @@ addConn(RunService.Heartbeat:Connect(function(dt)
         end
     end
 
-    -- REAL AIR-STRAFE
     strafeGain = 0
     if state.airStrafe and not onGround and not (state.pixelSurf and surfDown) then
         local wishdir = getWishDir(hum)
@@ -296,7 +307,6 @@ addConn(RunService.Heartbeat:Connect(function(dt)
         end
     end
 
-    -- PIXEL SURF
     if state.pixelSurf and surfDown and not onGround then
         local flat = Vector3.new(vel.X, 0, vel.Z)
         if flat.Magnitude > 0.1 then
@@ -305,12 +315,10 @@ addConn(RunService.Heartbeat:Connect(function(dt)
         end
     end
 
-    -- FAST LADDER
     if state.fastLadder and hum:GetState() == Enum.HumanoidStateType.Climbing then
         root.AssemblyLinearVelocity = Vector3.new(vel.X, vel.Y * 2.5, vel.Z)
     end
 
-    -- EDGE BUG
     if state.edgeBug and not onGround and not bhopActive and vel.Y < 0 then
         local params = RaycastParams.new()
         params.FilterDescendantsInstances = {char}
@@ -321,7 +329,6 @@ addConn(RunService.Heartbeat:Connect(function(dt)
         end
     end
 
-    -- LONG JUMP
     if state.longJump and ctrlDown and spaceDown and onGround and now - lastJump > 0.2 then
         local dir = hum.MoveDirection
         if dir.Magnitude > 0.1 then
@@ -331,7 +338,289 @@ addConn(RunService.Heartbeat:Connect(function(dt)
     end
 end))
 
--- ============ SPEEDO ============
+-- ============ COMBAT ============
+
+local function isPlayerValid(plr)
+    if plr == lp then return false end
+    if state.teamCheck and plr.Team and plr.Team == lp.Team then return false end
+    if state.friendCheck and plr.FriendStatus == Enum.FriendStatus.Friend then return false end
+    local char = plr.Character
+    if not char then return false end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then return false end
+    return true
+end
+
+local function getAimPart(plr)
+    local char = plr.Character
+    if not char then return nil end
+    if state.aimPart == "Head" then
+        return char:FindFirstChild("Head")
+    elseif state.aimPart == "Torso" then
+        return char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso")
+    end
+    return char:FindFirstChild("Head")
+end
+
+local function canSee(plr, part)
+    if not state.wallCheck then return true end
+    local params = RaycastParams.new()
+    params.FilterDescendantsInstances = {lp.Character, cam}
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local hit = workspace:Raycast(cam.CFrame.Position, part.Position - cam.CFrame.Position, params)
+    return hit == nil or hit.Instance:IsDescendantOf(plr.Character)
+end
+
+local function getAimTarget()
+    local camPos = cam.CFrame.Position
+    local camLook = cam.CFrame.LookVector
+    local best, bestAngle = nil, math.rad(state.aimFov)
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if not isPlayerValid(plr) then continue end
+        local part = getAimPart(plr)
+        if not part then continue end
+        if not canSee(plr, part) then continue end
+
+        local dir = (part.Position - camPos).Unit
+        local angle = math.acos(math.clamp(dir:Dot(camLook), -1, 1))
+        if angle < bestAngle then
+            bestAngle = angle
+            best = {player = plr, pos = part.Position, part = part}
+        end
+    end
+    return best
+end
+
+-- Aimbot (BindToRenderStep after camera)
+RunService:BindToRenderStep("NyxAim", Enum.RenderPriority.Camera.Value + 1, function()
+    if not state.aimbot then return end
+    if not UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then return end
+    local target = getAimTarget()
+    if not target then return end
+    local targetCF = CFrame.lookAt(cam.CFrame.Position, target.pos)
+    local alpha = math.clamp(1 - (state.aimSmooth / 100), 0.02, 1)
+    cam.CFrame = cam.CFrame:Lerp(targetCF, alpha)
+end)
+
+-- Silent aim (snap on fire)
+local function silentAimFire()
+    if not state.silentAim then return end
+    local target = getAimTarget()
+    if not target then return end
+    local orig = cam.CFrame
+    cam.CFrame = CFrame.lookAt(cam.CFrame.Position, target.pos)
+    task.delay(0.06, function()
+        if cam and cam.Parent then cam.CFrame = orig end
+    end)
+end
+
+addConn(UIS.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        silentAimFire()
+    end
+end))
+
+-- Trigger bot
+local lastTrig = 0
+addConn(RunService.Heartbeat:Connect(function()
+    if not state.triggerBot then return end
+    if not UIS:IsKeyDown(Enum.KeyCode.X) then return end
+    local now = tick()
+    if now - lastTrig < state.trigDelay then return end
+    local target = getAimTarget()
+    if not target then return end
+    lastTrig = now
+    pcall(function()
+        VIM:SendMouseButtonEvent(cam.ViewportSize.X / 2, cam.ViewportSize.Y / 2, 0, true, game, 0)
+        task.wait(0.02)
+        VIM:SendMouseButtonEvent(cam.ViewportSize.X / 2, cam.ViewportSize.Y / 2, 0, false, game, 0)
+    end)
+end))
+
+-- FOV circle
+local fovCircle
+if drawingSupported then
+    fovCircle = Drawing.new("Circle")
+    fovCircle.Thickness = 1
+    fovCircle.Color = Color3.fromRGB(90, 160, 255)
+    fovCircle.Filled = false
+    fovCircle.Transparency = 0.6
+    fovCircle.NumSides = 48
+    fovCircle.Visible = false
+end
+
+addConn(RunService.RenderStepped:Connect(function()
+    if not fovCircle then return end
+    if state.aimbot and state.aimFovCircle then
+        local viewport = cam.ViewportSize
+        local fovPx = math.tan(math.rad(state.aimFov)) * (viewport.Y / 2)
+        fovCircle.Radius = fovPx
+        fovCircle.Position = viewport / 2
+        fovCircle.Visible = true
+    else
+        fovCircle.Visible = false
+    end
+end))
+
+-- ============ ESP ============
+
+local espCache = {}
+
+local function createESP(plr)
+    if not drawingSupported then return end
+    local box = Drawing.new("Square")
+    box.Thickness = 1
+    box.Filled = false
+    box.Color = Color3.fromRGB(90, 160, 255)
+    box.Visible = false
+
+    local name = Drawing.new("Text")
+    name.Size = 14
+    name.Center = true
+    name.Outline = true
+    name.OutlineColor = Color3.new(0, 0, 0)
+    name.Color = Color3.fromRGB(255, 255, 255)
+    name.Visible = false
+
+    local dist = Drawing.new("Text")
+    dist.Size = 12
+    dist.Center = true
+    dist.Outline = true
+    dist.OutlineColor = Color3.new(0, 0, 0)
+    dist.Color = Color3.fromRGB(200, 200, 200)
+    dist.Visible = false
+
+    local healthBg = Drawing.new("Square")
+    healthBg.Filled = true
+    healthBg.Color = Color3.fromRGB(30, 30, 30)
+    healthBg.Visible = false
+
+    local healthFill = Drawing.new("Square")
+    healthFill.Filled = true
+    healthFill.Color = Color3.fromRGB(80, 220, 80)
+    healthFill.Visible = false
+
+    local tracer = Drawing.new("Line")
+    tracer.Thickness = 1
+    tracer.Color = Color3.fromRGB(90, 160, 255)
+    tracer.Transparency = 0.6
+    tracer.Visible = false
+
+    espCache[plr] = {box=box, name=name, dist=dist, healthBg=healthBg, healthFill=healthFill, tracer=tracer}
+end
+
+local function hideESP(cache)
+    for _, obj in pairs(cache) do obj.Visible = false end
+end
+
+local function getBox2D(char)
+    local root = char:FindFirstChild("HumanoidRootPart")
+    local head = char:FindFirstChild("Head")
+    if not root or not head then return nil end
+
+    local topPos = head.Position + Vector3.new(0, 0.8, 0)
+    local bottomPos = root.Position - Vector3.new(0, 3.2, 0)
+
+    local top, onTop = cam:WorldToViewportPoint(topPos)
+    local bottom, onBottom = cam:WorldToViewportPoint(bottomPos)
+    if not onTop or not onBottom then return nil end
+
+    local height = math.abs(bottom.Y - top.Y)
+    if height < 5 then return nil end
+    local width = height * 0.55
+
+    return {
+        x = top.X - width/2, y = top.Y,
+        w = width, h = height,
+        cx = top.X, cy = top.Y + height/2,
+    }
+end
+
+local function updateESP()
+    if not drawingSupported then return end
+    if not state.espBox and not state.espName and not state.espDistance
+       and not state.espHealth and not state.espTracer then
+        for _, cache in pairs(espCache) do hideESP(cache) end
+        return
+    end
+
+    for plr, cache in pairs(espCache) do
+        if plr == lp then hideESP(cache); continue end
+        if not isPlayerValid(plr) then hideESP(cache); continue end
+        local char = plr.Character
+        if not char then hideESP(cache); continue end
+        local box = getBox2D(char)
+        if not box then hideESP(cache); continue end
+
+        if state.espBox then
+            cache.box.Size = Vector2.new(box.w, box.h)
+            cache.box.Position = Vector2.new(box.x, box.y)
+            cache.box.Color = Color3.fromRGB(90, 160, 255)
+            cache.box.Visible = true
+        else cache.box.Visible = false end
+
+        if state.espName then
+            cache.name.Text = plr.Name
+            cache.name.Position = Vector2.new(box.cx, box.y - 18)
+            cache.name.Visible = true
+        else cache.name.Visible = false end
+
+        if state.espDistance then
+            local dist = (cam.CFrame.Position - char.HumanoidRootPart.Position).Magnitude
+            cache.dist.Text = string.format("%d m", math.floor(dist))
+            cache.dist.Position = Vector2.new(box.cx, box.y + box.h + 2)
+            cache.dist.Visible = true
+        else cache.dist.Visible = false end
+
+        if state.espHealth then
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hum then
+                local hp = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
+                cache.healthBg.Size = Vector2.new(3, box.h)
+                cache.healthBg.Position = Vector2.new(box.x - 6, box.y)
+                cache.healthBg.Visible = true
+                cache.healthFill.Size = Vector2.new(3, box.h * hp)
+                cache.healthFill.Position = Vector2.new(box.x - 6, box.y + box.h * (1 - hp))
+                cache.healthFill.Color = Color3.fromRGB(
+                    math.floor(255 * (1 - hp)),
+                    math.floor(255 * hp),
+                    40
+                )
+                cache.healthFill.Visible = true
+            else
+                cache.healthBg.Visible = false
+                cache.healthFill.Visible = false
+            end
+        else
+            cache.healthBg.Visible = false
+            cache.healthFill.Visible = false
+        end
+
+        if state.espTracer then
+            local vp = cam.ViewportSize
+            cache.tracer.From = Vector2.new(vp.X / 2, vp.Y)
+            cache.tracer.To = Vector2.new(box.cx, box.cy)
+            cache.tracer.Visible = true
+        else cache.tracer.Visible = false end
+    end
+end
+
+addConn(RunService.RenderStepped:Connect(updateESP))
+
+addConn(Players.PlayerAdded:Connect(createESP))
+addConn(Players.PlayerRemoving:Connect(function(plr)
+    local cache = espCache[plr]
+    if cache then
+        for _, obj in pairs(cache) do pcall(function() obj:Remove() end) end
+        espCache[plr] = nil
+    end
+end))
+
+for _, plr in ipairs(Players:GetPlayers()) do createESP(plr) end
+
+-- ============ SPEEDOMETER ============
 
 local function buildSpeedo()
     speedoGui = Instance.new("ScreenGui")
@@ -413,13 +702,9 @@ addConn(RunService.RenderStepped:Connect(function()
     elseif hum.MoveDirection.Magnitude > 0.1 then tag = "run"
     end
     statusLabel.Text = tag
-    if tag == "strafe+" then
-        statusLabel.TextColor3 = Color3.fromRGB(120, 220, 255)
-    elseif tag ~= "idle" and tag ~= "run" then
-        statusLabel.TextColor3 = Color3.fromRGB(90, 160, 255)
-    else
-        statusLabel.TextColor3 = Color3.fromRGB(120, 130, 160)
-    end
+    if tag == "strafe+" then statusLabel.TextColor3 = Color3.fromRGB(120, 220, 255)
+    elseif tag ~= "idle" and tag ~= "run" then statusLabel.TextColor3 = Color3.fromRGB(90, 160, 255)
+    else statusLabel.TextColor3 = Color3.fromRGB(120, 130, 160) end
 end))
 
 local function buildToast()
@@ -435,6 +720,12 @@ local function unload()
     pcall(saveConfig)
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
     conns = {}
+    pcall(function() RunService:UnbindFromRenderStep("NyxAim") end)
+    if fovCircle then pcall(function() fovCircle:Remove() end) end
+    for _, cache in pairs(espCache) do
+        for _, obj in pairs(cache) do pcall(function() obj:Remove() end) end
+    end
+    espCache = {}
     if gui then gui:Destroy() end
     if speedoGui then speedoGui:Destroy() end
     if toastGui then toastGui:Destroy() end
@@ -557,11 +848,8 @@ local function makeSlider(parent, text, key, min, max, yPos, onChange, isFloat)
     local function setFromX(x)
         local p = math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
         local val
-        if isFloat then
-            val = math.floor((min + (max - min) * p) * 10) / 10
-        else
-            val = math.floor(min + (max - min) * p)
-        end
+        if isFloat then val = math.floor((min + (max - min) * p) * 10) / 10
+        else val = math.floor(min + (max - min) * p) end
         state[key] = val
         fill.Size = UDim2.new(p, 0, 1, 0)
         label.Text = text .. ": " .. fmt(val)
@@ -602,14 +890,14 @@ end
 
 local function buildUI()
     gui = Instance.new("ScreenGui")
-    gui.Name = "NyxMovement"
+    gui.Name = "NyxSuite"
     gui.ResetOnSpawn = false
     gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
     gui.Parent = lp:WaitForChild("PlayerGui")
 
     mainFrame = Instance.new("Frame")
-    mainFrame.Size = UDim2.new(0, 340, 0, 540)
-    mainFrame.Position = UDim2.new(0.5, -170, 0.5, -270)
+    mainFrame.Size = UDim2.new(0, 360, 0, 560)
+    mainFrame.Position = UDim2.new(0.5, -180, 0.5, -280)
     mainFrame.BackgroundColor3 = Color3.fromRGB(14, 14, 18)
     mainFrame.BorderSizePixel = 0
     mainFrame.Active = true
@@ -648,7 +936,7 @@ local function buildUI()
     title.Size = UDim2.new(1, -50, 1, 0)
     title.Position = UDim2.new(0, 16, 0, 0)
     title.BackgroundTransparency = 1
-    title.Text = "Nyx  ·  Movement  v8"
+    title.Text = "Nyx  ·  Suite  v9"
     title.TextColor3 = Color3.fromRGB(230, 230, 240)
     title.Font = Enum.Font.GothamBold
     title.TextSize = 16
@@ -692,7 +980,7 @@ local function buildUI()
     tabBar.Parent = mainFrame
     local tabList = Instance.new("UIListLayout")
     tabList.FillDirection = Enum.FillDirection.Horizontal
-    tabList.Padding = UDim.new(0, 6)
+    tabList.Padding = UDim.new(0, 5)
     tabList.Parent = tabBar
 
     local content = Instance.new("Frame")
@@ -703,11 +991,10 @@ local function buildUI()
 
     local tabs = {}
     local tabButtons = {}
-    local tabUnderlines = {}
 
     local function makeTabButton(name)
         local b = Instance.new("TextButton")
-        b.Size = UDim2.new(0, 100, 1, 0)
+        b.Size = UDim2.new(0, 72, 1, 0)
         b.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
         b.Text = name
         b.TextColor3 = Color3.fromRGB(150, 150, 170)
@@ -717,15 +1004,6 @@ local function buildUI()
         b.AutoButtonColor = false
         b.Parent = tabBar
         Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
-
-        local ul = Instance.new("Frame")
-        ul.Size = UDim2.new(0.6, 0, 0, 2)
-        ul.Position = UDim2.new(0.2, 0, 1, -2)
-        ul.BackgroundColor3 = Color3.fromRGB(90, 160, 255)
-        ul.BorderSizePixel = 0
-        ul.BackgroundTransparency = 1
-        ul.Parent = b
-        table.insert(tabUnderlines, ul)
 
         b.MouseEnter:Connect(function()
             if not b:GetAttribute("active") then
@@ -746,15 +1024,11 @@ local function buildUI()
                     TextColor3 = Color3.fromRGB(150, 150, 170),
                 }):Play()
             end
-            for _, u in ipairs(tabUnderlines) do
-                TweenService:Create(u, TweenInfo.new(0.15), {BackgroundTransparency = 1}):Play()
-            end
             b:SetAttribute("active", true)
             TweenService:Create(b, TweenInfo.new(0.15), {
                 BackgroundColor3 = Color3.fromRGB(90, 160, 255),
                 TextColor3 = Color3.fromRGB(255, 255, 255),
             }):Play()
-            TweenService:Create(ul, TweenInfo.new(0.15), {BackgroundTransparency = 0}):Play()
             tabs[name].page.Visible = true
         end)
         b:SetAttribute("active", false)
@@ -777,10 +1051,14 @@ local function buildUI()
     end
 
     local pageMove = createPage("Move")
+    local pageCombat = createPage("Combat")
+    local pageVisual = createPage("Visual")
     local pageTune = createPage("Tune")
     local pageCfg  = createPage("Cfg")
 
     makeTabButton("Move")
+    makeTabButton("Combat")
+    makeTabButton("Visual")
     makeTabButton("Tune")
     makeTabButton("Cfg")
 
@@ -799,9 +1077,36 @@ local function buildUI()
     makeToggle(pageMove, "Speedometer", "speedometer", nil, y); y = y + 40
     pageMove.CanvasSize = UDim2.new(0, 0, 0, y + 10)
 
+    -- COMBAT
+    y = 6
+    makeCategoryLabel(pageCombat, "AIMBOT", y); y = y + 22
+    makeToggle(pageCombat, "Aimbot", "aimbot", "hold rmb", y); y = y + 40
+    makeToggle(pageCombat, "Silent Aim", "silentAim", "on click", y); y = y + 40
+    makeToggle(pageCombat, "Trigger Bot", "triggerBot", "hold x", y); y = y + 40
+    makeSlider(pageCombat, "Aim FOV", "aimFov", 10, 400, y); y = y + 50
+    makeSlider(pageCombat, "Aim Smooth", "aimSmooth", 1, 100, y); y = y + 50
+    makeSlider(pageCombat, "Trigger Delay", "trigDelay", 1, 20, y, function(v)
+        state.trigDelay = v / 100
+    end, false); y = y + 50
+    makeToggle(pageCombat, "Wall Check", "wallCheck", nil, y); y = y + 40
+    makeToggle(pageCombat, "Team Check", "teamCheck", nil, y); y = y + 40
+    makeToggle(pageCombat, "Friend Check", "friendCheck", nil, y); y = y + 40
+    makeToggle(pageCombat, "FOV Circle", "aimFovCircle", nil, y); y = y + 40
+    pageCombat.CanvasSize = UDim2.new(0, 0, 0, y + 10)
+
+    -- VISUAL
+    y = 6
+    makeCategoryLabel(pageVisual, "ESP", y); y = y + 22
+    makeToggle(pageVisual, "Box ESP", "espBox", nil, y); y = y + 40
+    makeToggle(pageVisual, "Name", "espName", nil, y); y = y + 40
+    makeToggle(pageVisual, "Distance", "espDistance", nil, y); y = y + 40
+    makeToggle(pageVisual, "Health Bar", "espHealth", nil, y); y = y + 40
+    makeToggle(pageVisual, "Tracer", "espTracer", nil, y); y = y + 40
+    pageVisual.CanvasSize = UDim2.new(0, 0, 0, y + 10)
+
     -- TUNE
     y = 6
-    makeCategoryLabel(pageTune, "BHOP ACCUMULATION", y); y = y + 22
+    makeCategoryLabel(pageTune, "BHOP", y); y = y + 22
     makeSlider(pageTune, "Hop Increment", "hopInc", 1, 8, y, nil, true); y = y + 50
     makeSlider(pageTune, "Max Bhop Speed", "maxBhopSpeed", 40, 120, y); y = y + 50
 
@@ -857,18 +1162,18 @@ local function buildUI()
     Instance.new("UICorner", bindButton).CornerRadius = UDim.new(0, 6)
 
     bindButton.MouseButton1Click:Connect(function()
-        listeningForBind = true
+        listeningForBind = "surfBind"
         bindButton.Text = "..."
         bindButton.BackgroundColor3 = Color3.fromRGB(90, 160, 255)
     end)
 
     addConn(UIS.InputBegan:Connect(function(input, gp)
         if gp then return end
-        if listeningForBind and input.UserInputType == Enum.UserInputType.Keyboard then
+        if listeningForBind == "surfBind" and input.UserInputType == Enum.UserInputType.Keyboard then
             state.surfBind = input.KeyCode
             bindButton.Text = input.KeyCode.Name
             bindButton.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
-            listeningForBind = false
+            listeningForBind = nil
             toast("bind set: " .. input.KeyCode.Name)
         end
     end))
@@ -908,14 +1213,14 @@ local function buildUI()
     end); y = y + 38
 
     y = y + 6
-    makeCategoryLabel(pageCfg, "HOW TO BHOP", y); y = y + 22
+    makeCategoryLabel(pageCfg, "HELP", y); y = y + 22
 
     local info = Instance.new("TextLabel")
-    info.Size = UDim2.new(1, -20, 0, 130)
+    info.Size = UDim2.new(1, -20, 0, 150)
     info.Position = UDim2.new(0, 10, 0, y)
     info.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
     info.BorderSizePixel = 0
-    info.Text = "  •  держи W + Space → поехал\n  •  каждый прыжок +2.5 studs/s (hop inc)\n  •  в воздухе A/D + мышка → air-strafe дуга\n  •  отпустил Space → acc плавно к базе\n  •  HUD \"acc:\" — накопленная скорость\n\n  RightShift — меню,  Space — bhop / double jump\n  Ctrl — slide,  Ctrl+Space — long jump"
+    info.Text = "  RightShift — меню\n  Space — bhop / double jump\n  Ctrl — slide,  Ctrl+Space — long jump\n  Bind — pixel surf\n\n  Aimbot — держи ПКМ\n  Silent Aim — клик ЛКМ (снап на кадр)\n  Trigger Bot — держи X (авто-клик по цели)\n  FOV circle — в Combat"
     info.TextColor3 = Color3.fromRGB(180, 180, 200)
     info.Font = Enum.Font.Gotham
     info.TextSize = 11
@@ -924,7 +1229,7 @@ local function buildUI()
     info.Parent = pageCfg
     Instance.new("UICorner", info).CornerRadius = UDim.new(0, 6)
 
-    pageCfg.CanvasSize = UDim2.new(0, 0, 0, y + 145)
+    pageCfg.CanvasSize = UDim2.new(0, 0, 0, y + 165)
 
     local unloadBtn = Instance.new("TextButton")
     unloadBtn.Size = UDim2.new(1, -20, 0, 34)
@@ -947,12 +1252,11 @@ local function buildUI()
     end)
 
     tabs["Move"].page.Visible = true
-    for i, b in ipairs(tabButtons) do
+    for _, b in ipairs(tabButtons) do
         if b.Text == "Move" then
             b:SetAttribute("active", true)
             b.BackgroundColor3 = Color3.fromRGB(90, 160, 255)
             b.TextColor3 = Color3.fromRGB(255, 255, 255)
-            tabUnderlines[i].BackgroundTransparency = 0
         end
     end
 
@@ -969,4 +1273,4 @@ bhopSpeed = state.speed
 buildUI()
 buildSpeedo()
 buildToast()
-print("[Nyx] v8.0 loaded — RightShift toggle menu.")
+print("[Nyx] v9.0 loaded — RightShift toggle menu.")
