@@ -1,4 +1,4 @@
---[[ Nyx Movement Suite v7.0 ]]--
+--[[ Nyx Movement Suite v8.0 ]]--
 
 local Players      = game:GetService("Players")
 local UIS          = game:GetService("UserInputService")
@@ -7,7 +7,7 @@ local TweenService = game:GetService("TweenService")
 
 local lp = Players.LocalPlayer
 local conns = {}
-local gui, mainFrame, speedoGui, speedoLabel, statusLabel, toastGui
+local gui, mainFrame, speedoGui, speedoLabel, statusLabel, accLabel, toastGui
 local listeningForBind = false
 
 local CONFIG_PATH = "nyx_movement_cfg.json"
@@ -23,24 +23,27 @@ local state = {
     slide       = false,
     slopeGuard  = true,
     speedometer = true,
-    speed         = 42,
+    speed         = 40,
     jumpPower     = 52,
     surfSpeed     = 26,
     gravity       = 196.2,
     strafeAccel   = 8,
     maxAirSpeed   = 55,
+    hopInc        = 2.5,
+    maxBhopSpeed  = 68,
     surfBind      = Enum.KeyCode.Q,
 }
 
 local strafeGain = 0
+local bhopSpeed = state.speed
+local lastHopTime = 0
 
--- ============ CONFIG I/O ============
+-- ============ CONFIG ============
 
 local function saveConfig()
     local data = {}
     for k, v in pairs(state) do
-        if typeof(v) == "EnumItem" then data[k] = v.Name
-        else data[k] = v end
+        if typeof(v) == "EnumItem" then data[k] = v.Name else data[k] = v end
     end
     local ok, enc = pcall(function() return game:GetService("HttpService"):JSONEncode(data) end)
     if not ok then return false end
@@ -57,9 +60,7 @@ local function loadConfig()
             if typeof(state[k]) == "EnumItem" then
                 local kc = Enum.KeyCode[v]
                 if kc then state[k] = kc end
-            else
-                state[k] = v
-            end
+            else state[k] = v end
         end
     end
     return true
@@ -75,10 +76,6 @@ end
 local function grounded(hum) return hum.FloorMaterial ~= Enum.Material.Air end
 
 local function getWishDir(hum)
-    local md = hum.MoveDirection
-    if md.Magnitude > 0.01 then
-        return Vector3.new(md.X, 0, md.Z).Unit
-    end
     local cam = workspace.CurrentCamera
     local cf = cam.CFrame
     local fwd = Vector3.new(cf.LookVector.X, 0, cf.LookVector.Z)
@@ -122,7 +119,7 @@ local function toast(text)
     lbl.TextXAlignment = Enum.TextXAlignment.Left
     lbl.Parent = frame
 
-    TweenService:Create(frame, TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+    TweenService:Create(frame, TweenInfo.new(0.3, Enum.EasingStyle.Quad), {
         Position = UDim2.new(1, -220, 1, -130)
     }):Play()
 
@@ -174,6 +171,7 @@ addConn(lp.CharacterAdded:Connect(function()
     sliding = false
     jumpsLeft = 1
     lastJump = 0
+    bhopSpeed = state.speed
 end))
 
 addConn(RunService.Heartbeat:Connect(function(dt)
@@ -200,12 +198,21 @@ addConn(RunService.Heartbeat:Connect(function(dt)
         hum.HipHeight = 0.2
     end
 
-    hum.WalkSpeed = sliding and (state.speed * 1.5) or state.speed
+    -- BHOP CHAIN DECAY: без пробела или после 0.35с простоя — плавно к базе
+    if not bhopActive then
+        if now - lastHopTime > 0.35 then
+            bhopSpeed = bhopSpeed + (state.speed - bhopSpeed) * math.min(dt * 6, 1)
+        end
+    end
+    if math.abs(bhopSpeed - state.speed) < 0.2 then bhopSpeed = state.speed end
 
-    -- HARD CAP in air (anti fly-away)
+    -- WalkSpeed = актуальная bhopSpeed → ground-solver не режет
+    hum.WalkSpeed = sliding and (state.speed * 1.5) or math.max(state.speed, bhopSpeed)
+
+    -- HARD CAP в воздухе
     if not onGround then
         local flat = Vector3.new(vel.X, 0, vel.Z)
-        local hardCap = state.maxAirSpeed * 1.2
+        local hardCap = math.max(state.maxBhopSpeed, state.maxAirSpeed) * 1.15
         if flat.Magnitude > hardCap then
             flat = flat.Unit * hardCap
             root.AssemblyLinearVelocity = Vector3.new(flat.X, vel.Y, flat.Z)
@@ -213,38 +220,62 @@ addConn(RunService.Heartbeat:Connect(function(dt)
         end
     end
 
-    -- GROUND clamp (not bhoping, not sliding)
-    if onGround and not bhopActive and not sliding then
-        local flat = Vector3.new(vel.X, 0, vel.Z)
-        if flat.Magnitude > state.speed + 2 then
-            local dir = flat.Unit
-            root.AssemblyLinearVelocity = Vector3.new(dir.X * state.speed, vel.Y, dir.Z * state.speed)
-        end
-    end
-
-    -- BHOP — preserve momentum instead of resetting
-    if bhopActive and onGround and now - lastJump > 0.05 then
+    -- === BHOP (с накоплением, БЕЗ дэша) ===
+    if bhopActive and onGround and now - lastJump > 0.04 then
         local slopeDeg = slopeAngle(char, root)
         if not (state.slopeGuard and slopeDeg > 45) then
             local flat = Vector3.new(vel.X, 0, vel.Z)
-            local carryCap = state.speed * 1.3
+            local curSpeed = flat.Magnitude
+            local curDir
+            local md = hum.MoveDirection
 
-            if flat.Magnitude < 0.5 then
-                local md = hum.MoveDirection
-                if md.Magnitude > 0.1 then
-                    flat = Vector3.new(md.X, 0, md.Z).Unit * state.speed * 0.85
-                end
-            elseif flat.Magnitude > carryCap then
-                flat = flat.Unit * carryCap
+            if curSpeed > 1.0 then
+                curDir = flat.Unit
+            elseif md.Magnitude > 0.1 then
+                curDir = Vector3.new(md.X, 0, md.Z).Unit
+                curSpeed = state.speed
+            else
+                local lv = root.CFrame.LookVector
+                curDir = Vector3.new(lv.X, 0, lv.Z).Unit
+                curSpeed = state.speed
             end
 
-            root.AssemblyLinearVelocity = Vector3.new(flat.X, vel.Y, flat.Z)
+            -- добавляем МАЛО, не сбрасываем
+            local newSpeed = math.min(curSpeed + state.hopInc, state.maxBhopSpeed)
+            bhopSpeed = newSpeed
+
+            -- направление: 85% прежнее, 15% к новому инпуту
+            local newDir = curDir
+            if md.Magnitude > 0.1 then
+                local wishDir = Vector3.new(md.X, 0, md.Z).Unit
+                local blended = curDir * 0.85 + wishDir * 0.15
+                if blended.Magnitude > 0.01 then newDir = blended.Unit end
+            end
+
+            -- Y не задаём — hum.Jump применит своё
+            root.AssemblyLinearVelocity = Vector3.new(
+                newDir.X * newSpeed,
+                math.max(vel.Y, 0),
+                newDir.Z * newSpeed
+            )
             hum.Jump = true
             lastJump = now
+            lastHopTime = now
         end
     end
 
-    -- REAL AIR-STRAFE (Quake/Source formula)
+    -- GROUND clamp если не в цепочке
+    if onGround and not bhopActive and not sliding then
+        if now - lastHopTime > 0.5 then
+            local flat = Vector3.new(vel.X, 0, vel.Z)
+            if flat.Magnitude > state.speed + 2 then
+                local dir = flat.Unit
+                root.AssemblyLinearVelocity = Vector3.new(dir.X * state.speed, vel.Y, dir.Z * state.speed)
+            end
+        end
+    end
+
+    -- REAL AIR-STRAFE
     strafeGain = 0
     if state.airStrafe and not onGround and not (state.pixelSurf and surfDown) then
         local wishdir = getWishDir(hum)
@@ -300,7 +331,7 @@ addConn(RunService.Heartbeat:Connect(function(dt)
     end
 end))
 
--- ============ SPEEDOMETER ============
+-- ============ SPEEDO ============
 
 local function buildSpeedo()
     speedoGui = Instance.new("ScreenGui")
@@ -309,7 +340,7 @@ local function buildSpeedo()
     speedoGui.Parent = lp:WaitForChild("PlayerGui")
 
     local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(0, 180, 0, 66)
+    frame.Size = UDim2.new(0, 180, 0, 86)
     frame.Position = UDim2.new(0, 20, 0, 20)
     frame.BackgroundColor3 = Color3.fromRGB(14, 14, 18)
     frame.BackgroundTransparency = 0.15
@@ -325,7 +356,7 @@ local function buildSpeedo()
 
     speedoLabel = Instance.new("TextLabel")
     speedoLabel.Size = UDim2.new(1, 0, 0, 30)
-    speedoLabel.Position = UDim2.new(0, 0, 0, 8)
+    speedoLabel.Position = UDim2.new(0, 0, 0, 6)
     speedoLabel.BackgroundTransparency = 1
     speedoLabel.Text = "0  studs/s"
     speedoLabel.TextColor3 = Color3.fromRGB(230, 230, 240)
@@ -333,9 +364,19 @@ local function buildSpeedo()
     speedoLabel.TextSize = 18
     speedoLabel.Parent = frame
 
+    accLabel = Instance.new("TextLabel")
+    accLabel.Size = UDim2.new(1, 0, 0, 16)
+    accLabel.Position = UDim2.new(0, 0, 0, 34)
+    accLabel.BackgroundTransparency = 1
+    accLabel.Text = "acc: 40"
+    accLabel.TextColor3 = Color3.fromRGB(120, 130, 160)
+    accLabel.Font = Enum.Font.Gotham
+    accLabel.TextSize = 11
+    accLabel.Parent = frame
+
     statusLabel = Instance.new("TextLabel")
     statusLabel.Size = UDim2.new(1, 0, 0, 20)
-    statusLabel.Position = UDim2.new(0, 0, 0, 40)
+    statusLabel.Position = UDim2.new(0, 0, 0, 54)
     statusLabel.BackgroundTransparency = 1
     statusLabel.Text = "idle"
     statusLabel.TextColor3 = Color3.fromRGB(120, 130, 160)
@@ -355,6 +396,12 @@ addConn(RunService.RenderStepped:Connect(function()
     local v = hum.RootPart.AssemblyLinearVelocity
     local flat = Vector3.new(v.X, 0, v.Z).Magnitude
     speedoLabel.Text = string.format("%d  studs/s", math.floor(flat))
+    accLabel.Text = string.format("acc: %.1f", bhopSpeed)
+    if bhopSpeed > state.speed + 1 then
+        accLabel.TextColor3 = Color3.fromRGB(255, 180, 90)
+    else
+        accLabel.TextColor3 = Color3.fromRGB(120, 130, 160)
+    end
 
     local tag = "idle"
     local onGround = grounded(hum)
@@ -427,7 +474,6 @@ local function makeToggle(parent, text, key, hint, yPos)
         pill.BorderSizePixel = 0
         pill.Parent = row
         Instance.new("UICorner", pill).CornerRadius = UDim.new(1, 0)
-
         local h = Instance.new("TextLabel")
         h.Size = UDim2.new(1, 0, 1, 0)
         h.BackgroundTransparency = 1
@@ -464,18 +510,10 @@ local function makeToggle(parent, text, key, hint, yPos)
         TweenService:Create(knob, TweenInfo.new(0.15), {
             Position = state[key] and UDim2.new(1, -18, 0.5, -8) or UDim2.new(0, 2, 0.5, -8)
         }):Play()
-        local popSize = state[key] and UDim2.new(0, 20, 0, 20) or UDim2.new(0, 16, 0, 16)
-        local popPos = state[key] and UDim2.new(1, -20, 0.5, -10) or UDim2.new(0, 0, 0.5, -10)
-        knob.Size = popSize
-        knob.Position = popPos
-        TweenService:Create(knob, TweenInfo.new(0.15), {
-            Size = UDim2.new(0, 16, 0, 16),
-            Position = state[key] and UDim2.new(1, -18, 0.5, -8) or UDim2.new(0, 2, 0.5, -8)
-        }):Play()
     end)
 end
 
-local function makeSlider(parent, text, key, min, max, yPos, onChange)
+local function makeSlider(parent, text, key, min, max, yPos, onChange, isFloat)
     local row = Instance.new("Frame")
     row.Size = UDim2.new(1, -20, 0, 44)
     row.Position = UDim2.new(0, 10, 0, yPos)
@@ -484,11 +522,16 @@ local function makeSlider(parent, text, key, min, max, yPos, onChange)
     row.Parent = parent
     Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
 
+    local function fmt(v)
+        if isFloat then return string.format("%.1f", v) end
+        return tostring(v)
+    end
+
     local label = Instance.new("TextLabel")
     label.Size = UDim2.new(1, -20, 0, 20)
     label.Position = UDim2.new(0, 12, 0, 4)
     label.BackgroundTransparency = 1
-    label.Text = text .. ": " .. tostring(state[key])
+    label.Text = text .. ": " .. fmt(state[key])
     label.TextColor3 = Color3.fromRGB(220, 220, 230)
     label.Font = Enum.Font.GothamMedium
     label.TextSize = 13
@@ -513,10 +556,15 @@ local function makeSlider(parent, text, key, min, max, yPos, onChange)
     local dragging = false
     local function setFromX(x)
         local p = math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
-        local val = math.floor(min + (max - min) * p)
+        local val
+        if isFloat then
+            val = math.floor((min + (max - min) * p) * 10) / 10
+        else
+            val = math.floor(min + (max - min) * p)
+        end
         state[key] = val
         fill.Size = UDim2.new(p, 0, 1, 0)
-        label.Text = text .. ": " .. tostring(val)
+        label.Text = text .. ": " .. fmt(val)
         fill.BackgroundColor3 = Color3.fromRGB(140, 200, 255)
         task.delay(0.15, function()
             if fill and fill.Parent then
@@ -560,8 +608,8 @@ local function buildUI()
     gui.Parent = lp:WaitForChild("PlayerGui")
 
     mainFrame = Instance.new("Frame")
-    mainFrame.Size = UDim2.new(0, 340, 0, 520)
-    mainFrame.Position = UDim2.new(0.5, -170, 0.5, -260)
+    mainFrame.Size = UDim2.new(0, 340, 0, 540)
+    mainFrame.Position = UDim2.new(0.5, -170, 0.5, -270)
     mainFrame.BackgroundColor3 = Color3.fromRGB(14, 14, 18)
     mainFrame.BorderSizePixel = 0
     mainFrame.Active = true
@@ -581,12 +629,8 @@ local function buildUI()
     }
     grad.Rotation = 45
     grad.Parent = stroke
-
-    -- pulsing gradient
     addConn(RunService.RenderStepped:Connect(function()
-        if stroke and stroke.Parent then
-            grad.Rotation = (grad.Rotation + 0.4) % 360
-        end
+        if stroke and stroke.Parent then grad.Rotation = (grad.Rotation + 0.4) % 360 end
     end))
 
     local header = Instance.new("Frame")
@@ -604,7 +648,7 @@ local function buildUI()
     title.Size = UDim2.new(1, -50, 1, 0)
     title.Position = UDim2.new(0, 16, 0, 0)
     title.BackgroundTransparency = 1
-    title.Text = "Nyx  ·  Movement  v7"
+    title.Text = "Nyx  ·  Movement  v8"
     title.TextColor3 = Color3.fromRGB(230, 230, 240)
     title.Font = Enum.Font.GothamBold
     title.TextSize = 16
@@ -623,9 +667,7 @@ local function buildUI()
     close.AutoButtonColor = false
     close.Parent = header
     Instance.new("UICorner", close).CornerRadius = UDim.new(1, 0)
-    close.MouseButton1Click:Connect(function()
-        mainFrame.Visible = false
-    end)
+    close.MouseButton1Click:Connect(function() mainFrame.Visible = false end)
 
     local dh, ds, dp
     header.InputBegan:Connect(function(input)
@@ -648,7 +690,6 @@ local function buildUI()
     tabBar.Position = UDim2.new(0, 10, 0, 52)
     tabBar.BackgroundTransparency = 1
     tabBar.Parent = mainFrame
-
     local tabList = Instance.new("UIListLayout")
     tabList.FillDirection = Enum.FillDirection.Horizontal
     tabList.Padding = UDim.new(0, 6)
@@ -696,7 +737,6 @@ local function buildUI()
                 TweenService:Create(b, TweenInfo.new(0.1), {BackgroundColor3 = Color3.fromRGB(22, 22, 28)}):Play()
             end
         end)
-
         b.MouseButton1Click:Connect(function()
             for _, t in pairs(tabs) do t.page.Visible = false end
             for _, other in ipairs(tabButtons) do
@@ -717,7 +757,6 @@ local function buildUI()
             TweenService:Create(ul, TweenInfo.new(0.15), {BackgroundTransparency = 0}):Play()
             tabs[name].page.Visible = true
         end)
-
         b:SetAttribute("active", false)
         table.insert(tabButtons, b)
         return b
@@ -762,18 +801,22 @@ local function buildUI()
 
     -- TUNE
     y = 6
-    makeCategoryLabel(pageTune, "STRAFE (CS-LIKE)", y); y = y + 22
+    makeCategoryLabel(pageTune, "BHOP ACCUMULATION", y); y = y + 22
+    makeSlider(pageTune, "Hop Increment", "hopInc", 1, 8, y, nil, true); y = y + 50
+    makeSlider(pageTune, "Max Bhop Speed", "maxBhopSpeed", 40, 120, y); y = y + 50
+
+    makeCategoryLabel(pageTune, "STRAFE", y); y = y + 22
     makeSlider(pageTune, "Strafe Accel", "strafeAccel", 2, 30, y); y = y + 50
     makeSlider(pageTune, "Max Air Speed", "maxAirSpeed", 20, 120, y); y = y + 50
 
-    makeCategoryLabel(pageTune, "SPEED", y); y = y + 22
-    makeSlider(pageTune, "Walk Speed", "speed", 16, 100, y); y = y + 50
+    makeCategoryLabel(pageTune, "BASE", y); y = y + 22
+    makeSlider(pageTune, "Walk Speed", "speed", 16, 100, y, function(v)
+        if bhopSpeed < v then bhopSpeed = v end
+    end); y = y + 50
     makeSlider(pageTune, "Jump Power", "jumpPower", 50, 250, y, function(v)
         local hum = getHum(); if hum then hum.JumpPower = v end
     end); y = y + 50
     makeSlider(pageTune, "Surf Speed", "surfSpeed", 8, 100, y); y = y + 50
-
-    makeCategoryLabel(pageTune, "PHYSICS", y); y = y + 22
     makeSlider(pageTune, "Gravity", "gravity", 40, 400, y, function(v)
         workspace.Gravity = v
     end); y = y + 50
@@ -855,7 +898,6 @@ local function buildUI()
         b.MouseLeave:Connect(function()
             TweenService:Create(b, TweenInfo.new(0.1), {BackgroundColor3 = color}):Play()
         end)
-        return b
     end
 
     makeActionBtn("Save Config", Color3.fromRGB(50, 90, 60), y, function()
@@ -866,14 +908,14 @@ local function buildUI()
     end); y = y + 38
 
     y = y + 6
-    makeCategoryLabel(pageCfg, "HOW TO STRAFE", y); y = y + 22
+    makeCategoryLabel(pageCfg, "HOW TO BHOP", y); y = y + 22
 
     local info = Instance.new("TextLabel")
     info.Size = UDim2.new(1, -20, 0, 130)
     info.Position = UDim2.new(0, 10, 0, y)
     info.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
     info.BorderSizePixel = 0
-    info.Text = "  Strafe работает как в CS:\n  •  в воздухе держи A или D\n  •  одновременно плавно поворачивай мышку\n    в ту же сторону\n  •  скорость крутится по дуге, не растёт\n  •  статус в спидометре \"strafe+\" — работаешь\n\n  RightShift  —  меню\n  Space  —  bhop / double jump\n  Ctrl  —  slide,  Ctrl+Space  —  long jump"
+    info.Text = "  •  держи W + Space → поехал\n  •  каждый прыжок +2.5 studs/s (hop inc)\n  •  в воздухе A/D + мышка → air-strafe дуга\n  •  отпустил Space → acc плавно к базе\n  •  HUD \"acc:\" — накопленная скорость\n\n  RightShift — меню,  Space — bhop / double jump\n  Ctrl — slide,  Ctrl+Space — long jump"
     info.TextColor3 = Color3.fromRGB(180, 180, 200)
     info.Font = Enum.Font.Gotham
     info.TextSize = 11
@@ -923,7 +965,8 @@ local function buildUI()
 end
 
 pcall(loadConfig)
+bhopSpeed = state.speed
 buildUI()
 buildSpeedo()
 buildToast()
-print("[Nyx] v7.0 loaded — RightShift toggle menu.")
+print("[Nyx] v8.0 loaded — RightShift toggle menu.")
